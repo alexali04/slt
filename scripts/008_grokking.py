@@ -281,6 +281,21 @@ def cmd_train(args: argparse.Namespace) -> None:
 # --- plot ---------------------------------------------------------------------
 
 
+def describe(cfg: dict) -> str:
+    """The configuration as a title fragment, read entirely from config.json.
+
+    ``.get`` on the newer keys: run directories written before depth and the
+    optimizer were configurable do not carry them, and an old run must still
+    plot (CONSTITUTION 9).
+    """
+    blocks = cfg.get("n_layers", 1)
+    return (f"{blocks} block{'s' if blocks != 1 else ''}, "
+            f"d_model {cfg['d_model']}, {cfg['n_heads']} heads, "
+            f"d_mlp {cfg['d_mlp']}, "
+            f"{cfg.get('optimizer', 'adamw')} lr {cfg['lr']:g}, "
+            f"weight decay {cfg['weight_decay']:g}, seed {cfg['seed']}")
+
+
 def figure_raw(rows: np.ndarray, cfg: dict, suffix: str = "") -> None:
     """CONSTITUTION 8a: the object, no annotation. Look at this one first."""
     step = rows["step"]
@@ -307,10 +322,10 @@ def figure_raw(rows: np.ndarray, cfg: dict, suffix: str = "") -> None:
     V.tidy(ax, theme=THEME, grid="both")
 
     fig.suptitle(
-        f"1-layer transformer, $(a+b)\\ \\mathrm{{mod}}\\ {cfg['p']}$, "
-        f"{cfg['train_frac']:.0%} of pairs used for training, full batch AdamW "
-        f"(lr {cfg['lr']}, weight decay {cfg['weight_decay']}), seed {cfg['seed']}",
-        fontsize=11, y=0.99,
+        f"$(a+b)\\ \\mathrm{{mod}}\\ {cfg['p']}$, "
+        f"{cfg['train_frac']:.0%} of pairs used for training, full batch\n"
+        f"{describe(cfg)}",
+        fontsize=10, y=0.995,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     save(fig, f"008_grokking_curves{suffix}.png", kind="raw")
@@ -322,7 +337,8 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> No
     a measurement read off these axes or a setting from config.json — nothing
     here interprets *why* the transition happens."""
     step = rows["step"]
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.6))
+    fig, axes = plt.subplots(2, 2, figsize=(11.8, 8.6))
+    axes = axes.ravel()
 
     def mark(ax):
         """The two milestone steps, on every panel, so the panels can be read
@@ -350,7 +366,7 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> No
     ax.set_ylim(-0.03, 1.03)
     ax.set_xlabel("optimizer step (log scale)")
     ax.set_ylabel("accuracy")
-    ax.set_title("A.  Train fits early, test generalises late")
+    ax.set_title("A.  Accuracy, and when each split is fit")
     ax.legend(loc="center left")
 
     def reached(step: int | None, what: str) -> str:
@@ -377,7 +393,7 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> No
     ax.set_yscale("log")
     ax.set_xlabel("optimizer step (log scale)")
     ax.set_ylabel("cross-entropy loss (log scale)")
-    ax.set_title("B.  Test loss rises before it falls")
+    ax.set_title("B.  Cross-entropy loss")
     ax.legend(loc="lower left")
     V.annotate(
         ax,
@@ -397,20 +413,52 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> No
     ax.set_title("C.  The cheap baseline: parameter norm")
     V.annotate(
         ax,
-        f"weight decay = {cfg['weight_decay']} (setting)\n"
+        f"weight decay = {cfg['weight_decay']:g} (setting)\n"
         f"peak {m['norm_peak']:.1f} at step {m['norm_peak_step']:,}\n"
         f"final {m['norm_final']:.1f}",
         xy=(0.97, 0.97), va="top", ha="right", theme=THEME,
     )
     V.tidy(ax, theme=THEME, grid="both")
 
+    # D. The same quantity after the transition, on linear axes. Panel C's log-x
+    # squeezes everything past the transition into the right-hand third, which is
+    # exactly the stretch where weight decay is still working.
+    ax = axes[3]
+    after = step >= m["grokked_step"] if m["grokked_step"] else np.zeros_like(step, bool)
+    if after.sum() >= 2:
+        norm_after = rows["weight_norm"][after]
+        ax.plot(step[after], norm_after, color=C[6])
+        start, end = float(norm_after[0]), float(norm_after[-1])
+        change = (end - start) / start
+        ax.set_xlabel("optimizer step (linear scale)")
+        ax.set_ylabel(r"$\|w\|_2$, all parameters")
+        V.annotate(
+            ax,
+            f"window: step {m['grokked_step']:,} to {m['final_step']:,}\n"
+            f"$\\|w\\|_2$: {start:.1f} $\\rightarrow$ {end:.1f}  ({change:+.1%})",
+            xy=(0.97, 0.97), va="top", ha="right", theme=THEME,
+        )
+    else:
+        # Never grokked, or grokked on the last recorded step: there is no window.
+        # Say so on the figure rather than leave a blank panel (CONSTITUTION 1c).
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.text(0.5, 0.5,
+                f"test accuracy never reached {ACC_THRESHOLD:.0%}\n"
+                f"(best {rows['test_acc'].max():.3f})\nno post-transition window",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=9, color=THEME.ink_secondary, linespacing=1.6)
+    ax.set_title(f"D.  Parameter norm after test acc $\\geq$ {ACC_THRESHOLD:.0%}, "
+                 f"linear axes")
+    V.tidy(ax, theme=THEME, grid="both")
+
     fig.suptitle(
-        f"Grokking on $(a+b)\\ \\mathrm{{mod}}\\ {cfg['p']}$ — "
-        f"{cfg['n_train']:,} train / {cfg['n_test']:,} test pairs, "
-        f"{cfg['d_model']}-dim 1-layer transformer, seed {cfg['seed']}",
-        fontsize=12, y=0.99,
+        f"008 — $(a+b)\\ \\mathrm{{mod}}\\ {cfg['p']}$, "
+        f"{cfg['n_train']:,} train / {cfg['n_test']:,} test pairs\n"
+        f"{describe(cfg)}",
+        fontsize=11, y=0.995,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     save(fig, f"008_grokking{suffix}.png")
     plt.close(fig)
 
