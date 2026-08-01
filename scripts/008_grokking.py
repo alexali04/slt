@@ -470,7 +470,20 @@ def cmd_plot(args: argparse.Namespace) -> None:
         sys.exit(f"no config at {p['config']} — the run directory is incomplete")
     cfg = json.loads(p["config"].read_text())["config"]
 
-    print(f"008 — grokking, {len(rows):,} recorded steps up to {int(rows['step'][-1]):,}")
+    # Name the directory and its configuration before any numbers. `plot` with no
+    # --tag reads the untagged run, which is easy to do by accident right after
+    # training a tagged variant, and every number below would then be the wrong
+    # run's while looking perfectly reasonable.
+    print(f"008 — reading {p['dir'].relative_to(ROOT)}/")
+    print(f"  {describe(cfg)}")
+    print(f"  {len(rows):,} recorded steps up to {int(rows['step'][-1]):,}")
+    if not args.tag:
+        others = [d.name.removeprefix(f"{RUN_NAME}-") for d in sorted(RUNS.iterdir())
+                  if d.is_dir() and d.name.startswith(f"{RUN_NAME}-")
+                  and (d / "metrics.csv").exists()]
+        if others:
+            print(f"  note: {len(others)} other run(s) here — plot them with "
+                  f"--tag {' / --tag '.join(others)}")
     m = milestones(rows)
     print_milestones(m)
     print()
