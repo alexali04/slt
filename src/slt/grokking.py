@@ -38,13 +38,16 @@ class Config:
     p: int = 113
     d_model: int = 128
     n_heads: int = 4
+    n_layers: int = 1
     d_mlp: int = 512
     train_frac: float = 0.3
 
+    optimizer: str = "adamw"
     lr: float = 1e-3
     weight_decay: float = 1.0
     beta1: float = 0.9
     beta2: float = 0.98
+    momentum: float = 0.9  # sgd only; ignored by adam/adamw
     warmup_steps: int = 10
     steps: int = 40_000
 
@@ -85,6 +88,34 @@ class Config:
         return d
 
 
+_TAG_ABBREV = {
+    "p": "p", "d_model": "d", "n_heads": "h", "n_layers": "L", "d_mlp": "mlp",
+    "train_frac": "tf", "optimizer": "", "lr": "lr", "weight_decay": "wd",
+    "beta1": "b1", "beta2": "b2", "momentum": "mom", "warmup_steps": "wu",
+    "steps": "steps", "seed": "s",
+}
+
+
+def auto_tag(cfg: Config) -> str:
+    """A short slug naming every field that differs from the reference config.
+
+    ``Config(lr=3e-3, n_layers=2)`` -> ``"L2-lr0.003"``. Empty for the reference
+    config itself. A sweep that wrote every variant into the same run directory
+    would be overwriting its own results, so anything non-default gets its own
+    directory and its own figure filenames unless a ``--tag`` says otherwise.
+    """
+    default = Config()
+    parts = []
+    for f in fields(Config):
+        value = getattr(cfg, f.name)
+        if value == getattr(default, f.name):
+            continue
+        prefix = _TAG_ABBREV.get(f.name, f.name)
+        shown = f"{value:g}" if isinstance(value, float) else f"{value}"
+        parts.append(f"{prefix}{shown}")
+    return "-".join(parts)
+
+
 # --- Data ---------------------------------------------------------------------
 
 
@@ -121,13 +152,59 @@ def make_data(cfg: Config, *, device: torch.device | str = "cpu") -> Split:
 # --- Model --------------------------------------------------------------------
 
 
-class OneLayerTransformer(nn.Module):
-    """Embed -> attention -> MLP -> unembed, with residual connections.
+def _randn(*shape: int, scale: float, generator: torch.Generator | None) -> nn.Parameter:
+    return nn.Parameter(torch.randn(*shape, generator=generator) / scale)
 
-    No LayerNorm, which is the reference setup: it makes the learned circuit
-    readable later, and it is what the grokking curves in the paper were
-    produced with. Attention has no biases; the MLP does, matching the
-    reference implementation.
+
+class Block(nn.Module):
+    """Attention then MLP, each residual. No LayerNorm — that is the reference
+    setup, and it keeps the learned circuit readable later. Attention has no
+    biases; the MLP does, matching the reference implementation."""
+
+    def __init__(self, cfg: Config, *, generator: torch.Generator | None = None):
+        super().__init__()
+        self.cfg = cfg
+        d, h, e, m = cfg.d_model, cfg.n_heads, cfg.d_head, cfg.d_mlp
+        root_d = math.sqrt(d)
+
+        self.W_Q = _randn(h, e, d, scale=root_d, generator=generator)
+        self.W_K = _randn(h, e, d, scale=root_d, generator=generator)
+        self.W_V = _randn(h, e, d, scale=root_d, generator=generator)
+        self.W_O = _randn(d, h * e, scale=root_d, generator=generator)
+
+        self.W_in = _randn(m, d, scale=root_d, generator=generator)
+        self.b_in = nn.Parameter(torch.zeros(m))
+        self.W_out = _randn(d, m, scale=root_d, generator=generator)
+        self.b_out = nn.Parameter(torch.zeros(d))
+
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
+        x = x + self._attention(x, causal_mask)
+        return x + self._mlp(x)
+
+    def _attention(self, x: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
+        q = torch.einsum("bpd,hed->bhpe", x, self.W_Q)
+        k = torch.einsum("bpd,hed->bhpe", x, self.W_K)
+        v = torch.einsum("bpd,hed->bhpe", x, self.W_V)
+
+        scores = torch.einsum("bhpe,bhqe->bhpq", q, k) / math.sqrt(self.cfg.d_head)
+        scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+        pattern = scores.softmax(dim=-1)
+
+        z = torch.einsum("bhpq,bhqe->bhpe", pattern, v)
+        z = z.permute(0, 2, 1, 3).reshape(x.shape[0], x.shape[1], -1)
+        return z @ self.W_O.T
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x @ self.W_in.T + self.b_in) @ self.W_out.T + self.b_out
+
+
+class Transformer(nn.Module):
+    """Embed -> ``n_layers`` blocks -> unembed.
+
+    ``n_layers=1`` is the reference configuration and the only one the published
+    grokking curves describe. Deeper is available (``--n-layers``) but is a
+    different model, not a bigger version of the same one: the paper's claims,
+    including the progress measures, are about the one-block circuit.
 
     NOTE: ``W_E`` is stored ``(d_vocab, d_model)`` rather than the reference's
     ``(d_model, d_vocab)`` so that embedding is a plain index. Mathematically
@@ -137,26 +214,14 @@ class OneLayerTransformer(nn.Module):
     def __init__(self, cfg: Config, *, generator: torch.Generator | None = None):
         super().__init__()
         self.cfg = cfg
-        d, h, e, m, v = cfg.d_model, cfg.n_heads, cfg.d_head, cfg.d_mlp, cfg.d_vocab
-
-        def randn(*shape: int, scale: float) -> nn.Parameter:
-            return nn.Parameter(torch.randn(*shape, generator=generator) / scale)
-
-        root_d = math.sqrt(d)
-        self.W_E = randn(v, d, scale=root_d)
-        self.W_pos = randn(cfg.n_ctx, d, scale=root_d)
-
-        self.W_Q = randn(h, e, d, scale=root_d)
-        self.W_K = randn(h, e, d, scale=root_d)
-        self.W_V = randn(h, e, d, scale=root_d)
-        self.W_O = randn(d, h * e, scale=root_d)
-
-        self.W_in = randn(m, d, scale=root_d)
-        self.b_in = nn.Parameter(torch.zeros(m))
-        self.W_out = randn(d, m, scale=root_d)
-        self.b_out = nn.Parameter(torch.zeros(d))
-
-        self.W_U = randn(d, v, scale=math.sqrt(v))
+        root_d = math.sqrt(cfg.d_model)
+        self.W_E = _randn(cfg.d_vocab, cfg.d_model, scale=root_d, generator=generator)
+        self.W_pos = _randn(cfg.n_ctx, cfg.d_model, scale=root_d, generator=generator)
+        self.blocks = nn.ModuleList(
+            Block(cfg, generator=generator) for _ in range(cfg.n_layers)
+        )
+        self.W_U = _randn(cfg.d_model, cfg.d_vocab,
+                          scale=math.sqrt(cfg.d_vocab), generator=generator)
 
         mask = torch.triu(torch.ones(cfg.n_ctx, cfg.n_ctx, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", mask)
@@ -164,25 +229,24 @@ class OneLayerTransformer(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """``(batch, n_ctx)`` of token ids -> ``(batch, n_ctx, d_vocab)`` logits."""
         x = self.W_E[tokens] + self.W_pos
-        x = x + self._attention(x)
-        x = x + self._mlp(x)
+        for block in self.blocks:
+            x = block(x, self.causal_mask)
         return x @ self.W_U
 
-    def _attention(self, x: torch.Tensor) -> torch.Tensor:
-        q = torch.einsum("bpd,hed->bhpe", x, self.W_Q)
-        k = torch.einsum("bpd,hed->bhpe", x, self.W_K)
-        v = torch.einsum("bpd,hed->bhpe", x, self.W_V)
 
-        scores = torch.einsum("bhpe,bhqe->bhpq", q, k) / math.sqrt(self.cfg.d_head)
-        scores = scores.masked_fill(self.causal_mask, torch.finfo(scores.dtype).min)
-        pattern = scores.softmax(dim=-1)
+def remap_legacy_state_dict(state: dict) -> dict:
+    """Load a checkpoint written before depth was a parameter.
 
-        z = torch.einsum("bhpq,bhqe->bhpe", pattern, v)
-        z = z.permute(0, 2, 1, 3).reshape(x.shape[0], x.shape[1], -1)
-        return z @ self.W_O.T
+    Those runs stored the single block's weights flat on the model (``W_Q``)
+    rather than under a block (``blocks.0.W_Q``). Run data is not disposable
+    (CONSTITUTION 9), so old checkpoints stay loadable::
 
-    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(x @ self.W_in.T + self.b_in) @ self.W_out.T + self.b_out
+        model.load_state_dict(remap_legacy_state_dict(torch.load(path)))
+    """
+    flat = ("W_Q", "W_K", "W_V", "W_O", "W_in", "b_in", "W_out", "b_out")
+    if not any(k in state for k in flat):
+        return state  # already in block form
+    return {(f"blocks.0.{k}" if k in flat else k): v for k, v in state.items()}
 
 
 # --- Metrics ------------------------------------------------------------------
@@ -249,6 +313,33 @@ def dense_then_every(eval_every: int = 10, dense_until: int = 100) -> Callable[[
     return should_record
 
 
+OPTIMIZERS = ("adamw", "adam", "sgd")
+
+
+def make_optimizer(cfg: Config, params) -> torch.optim.Optimizer:
+    """The reference uses AdamW. The others are here because weight decay is the
+    standard non-SLT account of grokking, and *how* the decay is applied is part
+    of that account:
+
+    - ``adamw`` — decoupled decay, subtracted from the weights directly.
+    - ``adam``  — the same coefficient applied as an L2 penalty *inside* the
+      gradient, which Adam's per-parameter scaling then rescales. At
+      ``weight_decay=1.0`` this is not a small difference from adamw.
+    - ``sgd``   — no adaptive scaling at all. Note that lr 1e-3 is tuned for
+      Adam; plain SGD at that lr will do very little.
+    """
+    if cfg.optimizer == "adamw":
+        return torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay,
+                                 betas=(cfg.beta1, cfg.beta2))
+    if cfg.optimizer == "adam":
+        return torch.optim.Adam(params, lr=cfg.lr, weight_decay=cfg.weight_decay,
+                                betas=(cfg.beta1, cfg.beta2))
+    if cfg.optimizer == "sgd":
+        return torch.optim.SGD(params, lr=cfg.lr, weight_decay=cfg.weight_decay,
+                               momentum=cfg.momentum)
+    raise ValueError(f"unknown optimizer {cfg.optimizer!r}, expected one of {OPTIMIZERS}")
+
+
 class Run:
     """Model + data + optimizer for one run. Does no I/O of any kind."""
 
@@ -258,12 +349,9 @@ class Run:
         # Distinct streams for the split and the init, so that changing one
         # thing later does not silently move the other.
         init_gen = torch.Generator().manual_seed(cfg.seed + 1)
-        self.model = OneLayerTransformer(cfg, generator=init_gen).to(self.device)
+        self.model = Transformer(cfg, generator=init_gen).to(self.device)
         self.data = make_data(cfg, device=self.device)
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(cfg.beta1, cfg.beta2),
-        )
+        self.opt = make_optimizer(cfg, self.model.parameters())
         self.sched = torch.optim.lr_scheduler.LambdaLR(
             self.opt, lambda i: min(1.0, (i + 1) / max(cfg.warmup_steps, 1))
         )

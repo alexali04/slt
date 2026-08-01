@@ -9,14 +9,24 @@ weight decay 1.0 on 30% of the pairs. Train accuracy saturates within ~1k steps;
 test accuracy stays at chance for roughly a further decade of steps and then
 rises to ~100%. Reproducing that gap is the whole deliverable.
 
-Two entry points, because the run is measured in hours and the plot in seconds
-(CONSTITUTION 9b):
+Training and plotting are separate entry points, because the run is measured in
+tens of minutes and the plot in seconds (CONSTITUTION 9b):
 
     python scripts/008_grokking.py train --device auto
     python scripts/008_grokking.py plot
+    python scripts/008_grokking.py list                    # every run, side by side
+    python scripts/008_grokking.py compare --runs A B C    # overlay them
 
-`train` writes `runs/008-grokking/` and needs torch. `plot` reads that directory
-and needs only numpy + matplotlib. A run killed halfway still plots.
+`train` writes `runs/008-grokking/` and needs torch. Everything else reads that
+directory and needs only numpy + matplotlib. A run killed halfway still plots.
+
+`train --help` lists the model and optimizer flags. Anything left at its default
+is the reference configuration; anything changed renames the run directory and
+the figures after the change, so a sweep cannot overwrite itself.
+
+`train --tensorboard` additionally streams the same scalars to `runs/<name>/tb`
+for watching a run as it goes (`tensorboard --logdir runs`). That is a view, not
+the record — `metrics.csv` is what the figures and the log entry come from.
 
 Figures:
   figures/raw/008_grokking_curves.png   — the curves, unannotated (CONSTITUTION 8a)
@@ -37,7 +47,7 @@ from pathlib import Path
 import _bootstrap  # noqa: F401  (path side effect)
 import matplotlib.pyplot as plt
 import numpy as np
-from _bootstrap import ROOT, run_dir, save
+from _bootstrap import ROOT, RUNS, run_dir, save
 
 from slt import viz as V
 
@@ -59,6 +69,7 @@ def paths(tag: str | None) -> dict[str, Path]:
         "config": directory / "config.json",
         "metrics": directory / "metrics.csv",
         "last": directory / "last.pt",
+        "tb": directory / "tb",
     }
 
 
@@ -141,9 +152,26 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     from slt import grokking as G
 
-    p = paths(args.tag)
-    cfg = G.Config(steps=args.steps, seed=args.seed)
+    cfg = G.Config(
+        p=args.p, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+        d_mlp=args.d_mlp, train_frac=args.train_frac,
+        optimizer=args.optimizer, lr=args.lr, weight_decay=args.weight_decay,
+        beta1=args.beta1, beta2=args.beta2, momentum=args.momentum,
+        warmup_steps=args.warmup_steps, steps=args.steps, seed=args.seed,
+    )
+    # A non-default config lands in its own directory unless told otherwise, so
+    # a sweep cannot overwrite its own earlier variants.
+    tag = args.tag or G.auto_tag(cfg) or None
+    p = paths(tag)
     device = pick_device(args.device)
+
+    started_before = p["metrics"].exists() and p["metrics"].stat().st_size > 0
+    if started_before and not (args.resume or args.force):
+        sys.exit(
+            f"{p['metrics'].relative_to(ROOT)} already holds a run.\n"
+            f"  --resume to continue it, --force to overwrite it, "
+            f"or --tag NAME to put this one somewhere else."
+        )
 
     run = G.Run(cfg, device=device)
     resumed_from = 0
@@ -163,12 +191,17 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     print(f"008 — grokking, ({cfg.p} x {cfg.p}) modular addition")
     print(f"  device        {device}")
-    print(f"  parameters    {run.n_params:,}")
+    print(f"  model         {cfg.n_layers} block(s), d_model {cfg.d_model}, "
+          f"{cfg.n_heads} heads, d_mlp {cfg.d_mlp}  ->  {run.n_params:,} parameters")
     print(f"  train / test  {cfg.n_train:,} / {cfg.n_test:,} pairs "
           f"({cfg.train_frac:.0%} train)")
-    print(f"  steps         {cfg.steps:,} (full batch, AdamW lr={cfg.lr}, "
-          f"wd={cfg.weight_decay})")
+    print(f"  optimizer     {cfg.optimizer} lr={cfg.lr:g} wd={cfg.weight_decay:g} "
+          f"betas=({cfg.beta1:g},{cfg.beta2:g})"
+          f"{f' momentum={cfg.momentum:g}' if cfg.optimizer == 'sgd' else ''}, "
+          f"full batch")
+    print(f"  steps         {cfg.steps:,} (warmup {cfg.warmup_steps})")
     print(f"  seed          {cfg.seed}")
+    print(f"  tag           {tag or '(reference config, untagged)'}")
     print(f"  writing       {p['dir'].relative_to(ROOT)}/")
     print()
 
@@ -177,6 +210,20 @@ def cmd_train(args: argparse.Namespace) -> None:
     writer = csv.DictWriter(handle, fieldnames=G.RECORD_FIELDS)
     if fresh:
         writer.writeheader()
+
+    # TensorBoard is a *view*, not the record: metrics.csv is what the figures and
+    # the log entry are built from (CONSTITUTION 9a). Nothing is written here that
+    # is not also in the CSV, so deleting tb/ costs nothing.
+    board = None
+    if args.tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            sys.exit("--tensorboard needs the tensorboard package: pip install tensorboard")
+        board = SummaryWriter(log_dir=str(p["tb"]), flush_secs=10)
+        board.add_text("config", f"```json\n{p['config'].read_text()}\n```", 0)
+        print(f"  tensorboard   {p['tb'].relative_to(ROOT)}/  "
+              f"(view with: tensorboard --logdir {RUNS.relative_to(ROOT)})\n")
 
     started = time.perf_counter()
     interrupted = False
@@ -187,15 +234,26 @@ def cmd_train(args: argparse.Namespace) -> None:
             writer.writerow(record.__dict__)
             handle.flush()  # a killed run must still plot (CONSTITUTION 9b)
 
+            if board is not None:
+                board.add_scalar("accuracy/train", record.train_acc, record.step)
+                board.add_scalar("accuracy/test", record.test_acc, record.step)
+                board.add_scalar("loss/train", record.train_loss, record.step)
+                board.add_scalar("loss/test", record.test_loss, record.step)
+                board.add_scalar("weight_norm", record.weight_norm, record.step)
+                board.add_scalar("lr", run.sched.get_last_lr()[0], record.step)
+
             if record.step % args.print_every == 0 or record.step == cfg.steps:
                 done = record.step - resumed_from
                 rate = done / max(time.perf_counter() - started, 1e-9)
                 remaining = (cfg.steps - record.step) / rate if rate else float("nan")
+                # flush: this runs for tens of minutes behind a pipe (notebook
+                # cell, nohup, tee), where stdout is block-buffered and progress
+                # would otherwise arrive in one lump at the end.
                 print(f"  step {record.step:>7,}  "
                       f"train {record.train_loss:9.2e}/{record.train_acc:.3f}  "
                       f"test {record.test_loss:9.2e}/{record.test_acc:.3f}  "
                       f"|w| {record.weight_norm:6.1f}  "
-                      f"{rate:5.1f} step/s  eta {remaining / 60:5.1f} min")
+                      f"{rate:5.1f} step/s  eta {remaining / 60:5.1f} min", flush=True)
 
             if args.ckpt_every and record.step % args.ckpt_every == 0:
                 torch.save(run.model.state_dict(),
@@ -206,23 +264,24 @@ def cmd_train(args: argparse.Namespace) -> None:
         print("\n  interrupted")
     finally:
         handle.close()
+        if board is not None:
+            board.close()
         torch.save(run.state_dict(), p["last"])
 
     elapsed = time.perf_counter() - started
     print(f"\n  stopped at step {run.step:,} after {elapsed / 60:.1f} min"
           f"{' (interrupted)' if interrupted else ''}")
     print_milestones(milestones(read_metrics(p["metrics"])))
-    print(f"\n  now: python scripts/008_grokking.py plot"
-          f"{f' --tag {args.tag}' if args.tag else ''}")
+    flag = f" --tag {tag}" if tag else ""
+    print(f"\n  now: python scripts/008_grokking.py plot{flag}")
     if interrupted:
-        print(f"  or resume: python scripts/008_grokking.py train --resume"
-              f"{f' --tag {args.tag}' if args.tag else ''}")
+        print("  or resume: re-run the exact same train command with --resume added")
 
 
 # --- plot ---------------------------------------------------------------------
 
 
-def figure_raw(rows: np.ndarray, cfg: dict) -> None:
+def figure_raw(rows: np.ndarray, cfg: dict, suffix: str = "") -> None:
     """CONSTITUTION 8a: the object, no annotation. Look at this one first."""
     step = rows["step"]
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
@@ -254,11 +313,11 @@ def figure_raw(rows: np.ndarray, cfg: dict) -> None:
         fontsize=11, y=0.99,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    save(fig, "008_grokking_curves.png", kind="raw")
+    save(fig, f"008_grokking_curves{suffix}.png", kind="raw")
     plt.close(fig)
 
 
-def figure_diagram(rows: np.ndarray, cfg: dict, m: dict) -> None:
+def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> None:
     """CONSTITUTION 8b: the object plus the argument. Every annotation below is
     a measurement read off these axes or a setting from config.json — nothing
     here interprets *why* the transition happens."""
@@ -352,7 +411,7 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict) -> None:
         fontsize=12, y=0.99,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.92))
-    save(fig, "008_grokking.png")
+    save(fig, f"008_grokking{suffix}.png")
     plt.close(fig)
 
 
@@ -367,8 +426,108 @@ def cmd_plot(args: argparse.Namespace) -> None:
     m = milestones(rows)
     print_milestones(m)
     print()
-    figure_raw(rows, cfg)
-    figure_diagram(rows, cfg, m)
+    # A tagged run writes tagged figures: a 200-step smoke test must not be able
+    # to overwrite the figure the log entry points at.
+    suffix = f"_{args.tag}" if args.tag else ""
+    figure_raw(rows, cfg, suffix)
+    figure_diagram(rows, cfg, m, suffix)
+
+
+# --- list / compare across runs -----------------------------------------------
+
+
+def load_run(directory: Path) -> tuple[dict, np.ndarray] | None:
+    """Config and metrics for one run directory, or None if it has neither."""
+    config, metrics = directory / "config.json", directory / "metrics.csv"
+    if not (config.exists() and metrics.exists() and metrics.stat().st_size):
+        return None
+    return json.loads(config.read_text()), read_metrics(metrics)
+
+
+def all_runs() -> list[tuple[str, dict, np.ndarray]]:
+    out = []
+    for directory in sorted(RUNS.iterdir()):
+        if not directory.is_dir() or not directory.name.startswith(RUN_NAME):
+            continue
+        loaded = load_run(directory)
+        if loaded:
+            out.append((directory.name, *loaded))
+    return out
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    runs = all_runs()
+    if not runs:
+        sys.exit(f"no runs in {RUNS.relative_to(ROOT)}/")
+
+    header = (f"{'run':<34} {'opt':<6} {'lr':>7} {'wd':>5} {'L':>2} {'steps':>7} "
+              f"{'memorised':>10} {'grokked':>9} {'test acc':>9}")
+    print(header)
+    print("-" * len(header))
+    for name, meta, rows in runs:
+        c, m = meta["config"], milestones(rows)
+        memorised = f"{m['memorised_step']:,}" if m["memorised_step"] else "never"
+        grokked = f"{m['grokked_step']:,}" if m["grokked_step"] else "never"
+        print(f"{name:<34} {c['optimizer']:<6} {c['lr']:>7g} {c['weight_decay']:>5g} "
+              f"{c.get('n_layers', 1):>2} {m['final_step']:>7,} "
+              f"{memorised:>10} {grokked:>9} {m['final_test_acc']:>9.4f}")
+    print(f"\n{len(runs)} run(s). Compare them with:")
+    print(f"  python scripts/008_grokking.py compare --runs "
+          f"{' '.join(n for n, _, _ in runs[:3])}")
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    """One figure per sweep, so 'what if I change X' is read off a single axis
+    instead of by flicking between PNGs."""
+    available = {name: (meta, rows) for name, meta, rows in all_runs()}
+    if not available:
+        sys.exit(f"no runs in {RUNS.relative_to(ROOT)}/")
+
+    names = args.runs or list(available)
+    missing = [n for n in names if n not in available]
+    if missing:
+        sys.exit(f"no metrics for: {', '.join(missing)}\n"
+                 f"  available: {', '.join(available)}")
+    if len(names) > len(C):
+        sys.exit(f"{len(names)} runs but only {len(C)} colour slots — "
+                 f"pass a subset with --runs")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.8))
+    for i, name in enumerate(names):
+        rows = available[name][1]
+        m = milestones(rows)
+        label = name.removeprefix(f"{RUN_NAME}-").removeprefix(RUN_NAME) or "reference"
+        grok = f"grok {m['grokked_step']:,}" if m["grokked_step"] else "no grok"
+        axes[0].plot(rows["step"], rows["test_acc"], color=C[i],
+                     label=f"{label}  ({grok})")
+        axes[0].plot(rows["step"], rows["train_acc"], color=C[i], lw=1.0,
+                     ls=(0, (3, 2)), alpha=0.55)
+        axes[1].plot(rows["step"], rows["weight_norm"], color=C[i], label=label)
+
+    ax = axes[0]
+    ax.set_xscale("log")
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_xlabel("optimizer step (log scale)")
+    ax.set_ylabel("accuracy")
+    ax.set_title("A.  Test accuracy (solid), train accuracy (dashed)")
+    ax.legend(loc="center left", fontsize=7)
+    V.annotate(ax, f"'grok' = first step with test acc $\\geq$ {ACC_THRESHOLD:.0%}\n"
+                   f"one seed per run unless the tag says otherwise",
+               xy=(0.97, 0.03), va="bottom", ha="right", theme=THEME)
+    V.tidy(ax, theme=THEME, grid="both")
+
+    ax = axes[1]
+    ax.set_xscale("log")
+    ax.set_xlabel("optimizer step (log scale)")
+    ax.set_ylabel(r"$\|w\|_2$, all parameters")
+    ax.set_title("B.  Parameter norm")
+    ax.legend(loc="best", fontsize=7)
+    V.tidy(ax, theme=THEME, grid="both")
+
+    fig.suptitle(f"008 — {len(names)} configurations compared", fontsize=12, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    save(fig, f"008_compare{f'_{args.name}' if args.name else ''}.png")
+    plt.close(fig)
 
 
 # --- entry point --------------------------------------------------------------
@@ -381,21 +540,72 @@ def main() -> None:
     tag.add_argument("--tag", default=None,
                      help="suffix for the run directory, to keep runs side by side")
 
-    t = sub.add_parser("train", parents=[tag], help="run the training (hours; needs torch)")
-    t.add_argument("--steps", type=int, default=40_000)
-    t.add_argument("--seed", type=int, default=0)
-    t.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
-    t.add_argument("--eval-every", type=int, default=10,
-                   help="steps between test-set evaluations (every step below 100)")
-    t.add_argument("--print-every", type=int, default=500)
-    t.add_argument("--ckpt-every", type=int, default=2_000, help="0 to disable")
-    t.add_argument("--resume", action="store_true",
-                   help="continue from last.pt in the run directory")
+    t = sub.add_parser(
+        "train", parents=[tag], help="run the training (needs torch)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="Defaults are the reference configuration (Nanda et al.). Change any of "
+               "them and the run gets its own directory and figures, named after what "
+               "changed, unless --tag says otherwise.",
+    )
+    model = t.add_argument_group("model")
+    model.add_argument("--n-layers", type=int, default=1,
+                       help="transformer blocks; 1 is the reference")
+    model.add_argument("--d-model", type=int, default=128, help="residual width")
+    model.add_argument("--n-heads", type=int, default=4,
+                       help="attention heads per block; must divide d-model")
+    model.add_argument("--d-mlp", type=int, default=512, help="MLP hidden width")
+    model.add_argument("--p", type=int, default=113, help="modulus; the task is a+b mod p")
+    model.add_argument("--train-frac", type=float, default=0.3,
+                       help="fraction of the p^2 pairs used for training")
+
+    opt = t.add_argument_group("optimization")
+    opt.add_argument("--optimizer", default="adamw", choices=["adamw", "adam", "sgd"],
+                     help="adamw decouples the decay; adam applies it as L2 in the "
+                          "gradient; sgd has no adaptive scaling")
+    opt.add_argument("--lr", type=float, default=1e-3, help="learning rate")
+    opt.add_argument("--weight-decay", type=float, default=1.0,
+                     help="0 removes it; the transition is not expected without it")
+    opt.add_argument("--beta1", type=float, default=0.9, help="adam/adamw only")
+    opt.add_argument("--beta2", type=float, default=0.98, help="adam/adamw only")
+    opt.add_argument("--momentum", type=float, default=0.9, help="sgd only")
+    opt.add_argument("--warmup-steps", type=int, default=10,
+                     help="linear lr warmup")
+    opt.add_argument("--steps", type=int, default=40_000, help="full-batch steps")
+    opt.add_argument("--seed", type=int, default=0,
+                     help="drives both the train/test split and the init")
+
+    runtime = t.add_argument_group("runtime")
+    runtime.add_argument("--device", default="auto",
+                         choices=["auto", "cpu", "mps", "cuda"],
+                         help="auto picks cuda, then mps, then cpu")
+    runtime.add_argument("--eval-every", type=int, default=10,
+                         help="steps between test evaluations (every step below 100)")
+    runtime.add_argument("--print-every", type=int, default=500,
+                         help="steps between progress lines")
+    runtime.add_argument("--ckpt-every", type=int, default=2_000,
+                         help="steps between checkpoints; 0 to disable")
+    runtime.add_argument("--tensorboard", action="store_true",
+                         help="also stream scalars to runs/<name>/tb for live viewing; "
+                              "metrics.csv stays the record either way")
+    runtime.add_argument("--resume", action="store_true",
+                         help="continue from last.pt in the run directory")
+    runtime.add_argument("--force", action="store_true",
+                         help="overwrite an existing run in that directory")
     t.set_defaults(func=cmd_train)
 
     p = sub.add_parser("plot", parents=[tag],
-                       help="draw the figures from a run directory")
+                       help="draw the figures for one run directory")
     p.set_defaults(func=cmd_plot)
+
+    ls = sub.add_parser("list", help="every run directory, with its settings and result")
+    ls.set_defaults(func=cmd_list)
+
+    cmp_ = sub.add_parser("compare", help="overlay several runs on one figure")
+    cmp_.add_argument("--runs", nargs="+", default=None,
+                      help="run directory names (default: all of them)")
+    cmp_.add_argument("--name", default=None,
+                      help="suffix for the output figure filename")
+    cmp_.set_defaults(func=cmd_compare)
 
     args = parser.parse_args()
     args.func(args)

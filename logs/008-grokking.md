@@ -4,7 +4,8 @@
 - **Type:** EXPERIMENT — **pre-registered, NOT YET RUN.** The hypothesis section below
   is empty and stays empty until Alex fills it (CONSTITUTION 1). Claude does not write
   it, and it is not backfilled after the curves are seen.
-- **Code:** `scripts/008_grokking.py` (`train` / `plot`), `src/slt/grokking.py`
+- **Code:** `scripts/008_grokking.py` (`train` / `plot`), `src/slt/grokking.py`,
+  `notebooks/008_grokking_colab.ipynb` (a runner only — no model code, CONSTITUTION 4e)
 - **Figures:** `figures/raw/008_grokking_curves.png` (8a),
   `figures/diagram/008_grokking.png` (8b)
 - **Run data:** `runs/008-grokking/` (CONSTITUTION 9)
@@ -73,6 +74,17 @@ stored transposed (identical maths, matters only if reference weights are ever l
 Recording schedule: every step up to 100, then every 10 (`--eval-every`). The plot is
 read on a log-x axis, where uniform sampling puts almost nothing in the first decade.
 
+**Every number in the table above is a CLI default, not a hardcoded constant** — depth,
+width, heads, modulus, train fraction, optimizer, learning rate, weight decay, betas,
+momentum, warmup and seed are all flags (`train --help`). A run that changes any of them
+gets its own run directory and its own figure filenames, derived from what changed, so a
+sweep cannot overwrite this entry's results.
+
+**Sweeps are not this entry.** 008 is the replication at the reference configuration.
+"What happens at 2 blocks / higher lr / lower weight decay" is a different question and
+therefore a different log entry with its own hypothesis (CONSTITUTION 1). This entry's
+numbers must stay the reference ones.
+
 **Numerical caveat, stated in advance (rule 3c).** Loss is computed in float64 because
 after grokking the train loss reaches ~$10^{-8}$ and a float32 `log_softmax` has already
 lost the digits that distinguish that from $10^{-6}$. **MPS has no float64**, so on that
@@ -88,10 +100,13 @@ all three panels so they can be read against each other; both are measurements, 
 interpretations.
 
 **Estimated cost (rule 9e):** ~630 TFLOP total. Estimated 20–40 min on the M5 GPU
-(`--device mps`), 1.5–3 h on CPU. **Estimate, not a measurement** — nothing has been
-timed, because torch is not installed yet. The script prints a live step/s rate and ETA
-from the first `--print-every` block, so the real number is known within a minute of
-starting; record it below.
+(`--device mps`), 1.5–3 h on CPU, 10–25 min on a Colab T4. **Estimates, not
+measurements** — nothing has been timed, because torch is not installed locally. The
+script prints a live step/s rate and ETA from the first `--print-every` block, so the
+real number is known within a minute of starting; record it below.
+
+Note that the Colab path uses CUDA and therefore *does* get float64, so the loss tail is
+trustworthy there in a way it is not on MPS.
 
 **Actual cost:** _(pending)_
 

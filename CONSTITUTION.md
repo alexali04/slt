@@ -132,8 +132,11 @@ slt/
 │   ├── models.py        # loss landscapes, as pure functions of parameters
 │   ├── rlct.py          # RLCT / learning-coefficient estimators
 │   ├── dynamics.py      # GD, sharpness tracking, Hessian spectra
+│   ├── grokking.py      # rule 0 exception — needs torch, so kept out of __init__
 │   └── viz.py           # shared plotting style + reusable panels
 ├── scripts/             # NNN_name.py — one script per log entry, runnable, reproducible
+├── notebooks/           # rule 4e — thin runners for hosted GPUs, never implementations
+├── runs/                # rule 9 — metrics and checkpoints from long runs; git-ignored
 └── figures/             # generated output; regenerable, safe to delete
     ├── raw/             # rule 8a — the object, unannotated
     └── diagram/         # rule 8b — the object plus the argument
@@ -149,6 +152,16 @@ produces the figures logged in `logs/002-foo.md`.
 the scripts. Never hand-edit a figure.
 
 4d. **Seeds are fixed and recorded** for anything stochastic.
+
+4e. **Notebooks drive, they do not implement.** A notebook in `notebooks/` exists to get a
+script onto hardware this laptop does not have — a hosted GPU — and may contain setup,
+invocation, and display. It must not contain a model, an estimator, or a training loop.
+The moment a cell holds logic the repo does not, the run stops being reproducible from
+the repo, and the notebook's outputs become the only record of what was run.
+
+Notebooks are named for the entry they run (`notebooks/008_grokking_colab.ipynb`) and
+are committed **without output cells** — a notebook full of stale outputs is a figure
+nobody can regenerate (4c), with the added problem that its outputs get read as results.
 
 ---
 
@@ -303,6 +316,12 @@ hours again.
 - `metrics.csv` — one row per recorded step, **flushed as it is written**. Never
   buffered until the end; the end may not arrive.
 - `ckpt-NNNNNN.pt`, `last.pt` — checkpoints, where there are any.
+- `tb/` — TensorBoard event files, where a run streams them.
+
+**Live dashboards are a view, not the record.** A number may be read out of TensorBoard
+only if it is also in `metrics.csv`; nothing is logged, plotted or claimed from a
+dashboard alone. Event files are as disposable as figures — deleting `tb/` must cost
+nothing, and a run that writes only to a dashboard has not recorded anything.
 
 9b. **Train and plot are separate entry points of the same script.** Rule 4b still holds
 — one script per log entry — so this is `python scripts/NNN_x.py train` and
@@ -337,3 +356,5 @@ partial with the step it reached. Same spirit as 1c: the record says what happen
 | 2026-07-31 | 9 | Added. Long runs write a `runs/NNN-slug/` directory; train and plot are separate entry points of one script; Alex starts anything measured in hours. Prompted by entry 008. |
 | 2026-07-31 | 0 | Added the **declared exceptions** clause and listed 008's grokking transformer, which is a neural network with no known RLCT and so is outside the model zoo rule 0 describes. |
 | 2026-07-31 | 7d | `torch` pre-approval widened from MCMC-based LLC estimation to also cover 008, and the rule that it stays an *optional* dependency written down. |
+| 2026-07-31 | 4, 4e | Added `notebooks/` and `runs/` to the layout, and rule 4e: notebooks drive scripts onto hosted GPUs, never implement anything, and are committed without output cells. |
+| 2026-07-31 | 9a | Added `tb/` to the run directory, and the rule that a live dashboard is a view and never the record: nothing is claimed from TensorBoard that is not also in `metrics.csv`. |

@@ -29,6 +29,7 @@ src/slt/      importable library, no side effects on import
   grokking.py   1-layer transformer on modular addition (needs torch; not
                 re-exported from __init__, so `import slt` works without it)
 scripts/      NNN_name.py, one per log entry, runnable and reproducible
+notebooks/    thin Colab runners for the entries that want a GPU (CONSTITUTION 4e)
 logs/         NNN-slug.md, one per draft or experiment
 figures/
   raw/          the object, unannotated (CONSTITUTION 8a)
@@ -55,3 +56,12 @@ Entry 008 is the exception: it trains a model for tens of minutes, so it splits 
 .venv/bin/python scripts/008_grokking.py train --device auto
 .venv/bin/python scripts/008_grokking.py plot
 ```
+
+`train --help` lists the model and optimizer flags (depth, width, lr, weight decay,
+optimizer, seed); changing any of them gives the run its own directory and figures.
+`list` and `compare` read several runs side by side. Add `--tensorboard` to watch a run
+live (`tensorboard --logdir runs`) — a view only, `metrics.csv` stays the record.
+
+On a GPU instead, open [`notebooks/008_grokking_colab.ipynb`](notebooks/008_grokking_colab.ipynb)
+in Colab. It clones this repo and drives the same script — no model code lives in the
+notebook (CONSTITUTION 4e).
