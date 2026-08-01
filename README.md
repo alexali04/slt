@@ -54,13 +54,15 @@ Entry 008 is the exception: it trains a model for tens of minutes, so it splits 
 ```bash
 .venv/bin/pip install torch
 .venv/bin/python scripts/008_grokking.py train --device auto
-.venv/bin/python scripts/008_grokking.py plot
+.venv/bin/python scripts/008_grokking.py plot --run 008-grokking
 ```
 
 `train --help` lists the model and optimizer flags (depth, width, lr, weight decay,
-optimizer, seed); changing any of them gives the run its own directory and figures.
-`list` and `compare` read several runs side by side. Add `--tensorboard` to watch a run
-live (`tensorboard --logdir runs`) — a view only, `metrics.csv` stays the record.
+optimizer, seed). Changing any of them gives the run its own **run id**, which is its
+directory name and also names its figures — `--n-layers 2` is `008-grokking-L2`. `train`
+prints the id, `list` lists them all, `plot --run <id>` draws one and
+`compare --runs <ids>` overlays several. Add `--tensorboard` to watch a run live
+(`tensorboard --logdir runs`) — a view only, `metrics.csv` stays the record.
 
 On a GPU instead, open [`notebooks/008_grokking_colab.ipynb`](notebooks/008_grokking_colab.ipynb)
 in Colab. It clones this repo and drives the same script — no model code lives in the

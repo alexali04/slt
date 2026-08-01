@@ -6,9 +6,12 @@
   it, and it is not backfilled after the curves are seen.
 - **Code:** `scripts/008_grokking.py` (`train` / `plot`), `src/slt/grokking.py`,
   `notebooks/008_grokking_colab.ipynb` (a runner only — no model code, CONSTITUTION 4e)
-- **Figures:** `figures/raw/008_grokking_curves.png` (8a),
-  `figures/diagram/008_grokking.png` (8b)
+- **Figures:** `figures/raw/008-grokking_curves.png` (8a),
+  `figures/diagram/008-grokking.png` (8b)
 - **Run data:** `runs/008-grokking/` (CONSTITUTION 9)
+- **Run id:** `008-grokking`. Every run is addressed by one identifier, which is its
+  directory name and also names its figures; variants derive theirs from what they
+  changed (`008-grokking-L2`). `plot --run <id>`.
 - **Seeds / settings:** seed 0. The seed drives two independent streams: the train/test
   split (`seed`) and the parameter init (`seed + 1`), both on explicit CPU generators so
   the run is reproducible across devices.

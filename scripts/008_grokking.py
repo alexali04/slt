@@ -13,8 +13,8 @@ Training and plotting are separate entry points, because the run is measured in
 tens of minutes and the plot in seconds (CONSTITUTION 9b):
 
     python scripts/008_grokking.py train --device auto
-    python scripts/008_grokking.py plot
-    python scripts/008_grokking.py list                    # every run, side by side
+    python scripts/008_grokking.py plot --run 008-grokking
+    python scripts/008_grokking.py list                    # every run id, side by side
     python scripts/008_grokking.py compare --runs A B C    # overlay them
 
 `train` writes `runs/008-grokking/` and needs torch. Everything else reads that
@@ -28,9 +28,13 @@ the figures after the change, so a sweep cannot overwrite itself.
 for watching a run as it goes (`tensorboard --logdir runs`). That is a view, not
 the record — `metrics.csv` is what the figures and the log entry come from.
 
-Figures:
-  figures/raw/008_grokking_curves.png   — the curves, unannotated (CONSTITUTION 8a)
-  figures/diagram/008_grokking.png      — with the transition measured (8b)
+Every run has a **run id**, which is its directory name — `008-grokking` for the
+reference configuration, `008-grokking-L2` for `--n-layers 2`. `train` prints it,
+`list` lists it, and `plot --run <id>` draws it. The figures are named after it
+too, so the command, the run directory and the files on disk cannot drift apart:
+
+  figures/raw/<run id>_curves.png   — the curves, unannotated (CONSTITUTION 8a)
+  figures/diagram/<run id>.png      — with the transition measured (8b)
 
 See logs/008-grokking.md.
 """
@@ -62,9 +66,21 @@ ACC_THRESHOLD = 0.99  # what counts as "solved", for both memorisation and grokk
 # --- Run directory ------------------------------------------------------------
 
 
-def paths(tag: str | None) -> dict[str, Path]:
-    directory = run_dir(RUN_NAME if not tag else f"{RUN_NAME}-{tag}")
+def run_id_for(tag: str | None) -> str:
+    """The one identifier for a run: its directory name.
+
+    `--tag` is an input at training time; the run id is the handle for
+    everything afterwards. Keeping them the same string is deliberate — the
+    figures, the run directory and the `plot` argument all derive from it, so
+    they cannot drift apart the way a separate tag and filename suffix could.
+    """
+    return RUN_NAME if not tag else f"{RUN_NAME}-{tag}"
+
+
+def paths(run_id: str) -> dict[str, Path]:
+    directory = run_dir(run_id)
     return {
+        "id": run_id,
         "dir": directory,
         "config": directory / "config.json",
         "metrics": directory / "metrics.csv",
@@ -161,8 +177,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
     # A non-default config lands in its own directory unless told otherwise, so
     # a sweep cannot overwrite its own earlier variants.
-    tag = args.tag or G.auto_tag(cfg) or None
-    p = paths(tag)
+    run_id = run_id_for(args.tag or G.auto_tag(cfg) or None)
+    p = paths(run_id)
     device = pick_device(args.device)
 
     started_before = p["metrics"].exists() and p["metrics"].stat().st_size > 0
@@ -183,9 +199,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         print(f"  --resume given but no checkpoint at {p['last']}; starting fresh")
 
     p["config"].write_text(json.dumps(
-        {"config": cfg.to_dict(), "device": device, "n_params": run.n_params,
-         "acc_threshold": ACC_THRESHOLD, "eval_every": args.eval_every,
-         "torch": torch.__version__},
+        {"run_id": run_id, "config": cfg.to_dict(), "device": device,
+         "n_params": run.n_params, "acc_threshold": ACC_THRESHOLD,
+         "eval_every": args.eval_every, "torch": torch.__version__},
         indent=2,
     ) + "\n")
 
@@ -201,8 +217,10 @@ def cmd_train(args: argparse.Namespace) -> None:
           f"full batch")
     print(f"  steps         {cfg.steps:,} (warmup {cfg.warmup_steps})")
     print(f"  seed          {cfg.seed}")
-    print(f"  tag           {tag or '(reference config, untagged)'}")
     print(f"  writing       {p['dir'].relative_to(ROOT)}/")
+    print()
+    print(f"  RUN ID  {run_id}")
+    print(f"          python scripts/008_grokking.py plot --run {run_id}")
     print()
 
     fresh = not (args.resume and p["metrics"].exists())
@@ -272,8 +290,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     print(f"\n  stopped at step {run.step:,} after {elapsed / 60:.1f} min"
           f"{' (interrupted)' if interrupted else ''}")
     print_milestones(milestones(read_metrics(p["metrics"])))
-    flag = f" --tag {tag}" if tag else ""
-    print(f"\n  now: python scripts/008_grokking.py plot{flag}")
+    print(f"\n  RUN ID  {run_id}")
+    print(f"          python scripts/008_grokking.py plot --run {run_id}")
     if interrupted:
         print("  or resume: re-run the exact same train command with --resume added")
 
@@ -296,7 +314,7 @@ def describe(cfg: dict) -> str:
             f"weight decay {cfg['weight_decay']:g}, seed {cfg['seed']}")
 
 
-def figure_raw(rows: np.ndarray, cfg: dict, suffix: str = "") -> None:
+def figure_raw(rows: np.ndarray, cfg: dict, run_id: str) -> None:
     """CONSTITUTION 8a: the object, no annotation. Look at this one first."""
     step = rows["step"]
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
@@ -328,11 +346,11 @@ def figure_raw(rows: np.ndarray, cfg: dict, suffix: str = "") -> None:
         fontsize=10, y=0.995,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    save(fig, f"008_grokking_curves{suffix}.png", kind="raw")
+    save(fig, f"{run_id}_curves.png", kind="raw")
     plt.close(fig)
 
 
-def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> None:
+def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, run_id: str) -> None:
     """CONSTITUTION 8b: the object plus the argument. Every annotation below is
     a measurement read off these axes or a setting from config.json — nothing
     here interprets *why* the transition happens."""
@@ -459,39 +477,37 @@ def figure_diagram(rows: np.ndarray, cfg: dict, m: dict, suffix: str = "") -> No
         fontsize=11, y=0.995,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    save(fig, f"008_grokking{suffix}.png")
+    save(fig, f"{run_id}.png")
     plt.close(fig)
 
 
 def cmd_plot(args: argparse.Namespace) -> None:
-    p = paths(args.tag)
+    p = paths(args.run)
     rows = read_metrics(p["metrics"])
     if not p["config"].exists():
         sys.exit(f"no config at {p['config']} — the run directory is incomplete")
     cfg = json.loads(p["config"].read_text())["config"]
 
-    # Name the directory and its configuration before any numbers. `plot` with no
-    # --tag reads the untagged run, which is easy to do by accident right after
-    # training a tagged variant, and every number below would then be the wrong
-    # run's while looking perfectly reasonable.
+    # Name the run and its configuration before any numbers. Plotting the wrong
+    # run is easy to do right after training a variant, and every number below
+    # would then be the wrong run's while looking perfectly reasonable.
     print(f"008 — reading {p['dir'].relative_to(ROOT)}/")
-    print(f"  {describe(cfg)}")
+    print(f"  run id  {p['id']}")
+    print(f"  config  {describe(cfg)}")
     print(f"  {len(rows):,} recorded steps up to {int(rows['step'][-1]):,}")
-    if not args.tag:
-        others = [d.name.removeprefix(f"{RUN_NAME}-") for d in sorted(RUNS.iterdir())
-                  if d.is_dir() and d.name.startswith(f"{RUN_NAME}-")
-                  and (d / "metrics.csv").exists()]
-        if others:
-            print(f"  note: {len(others)} other run(s) here — plot them with "
-                  f"--tag {' / --tag '.join(others)}")
+    others = [d.name for d in sorted(RUNS.iterdir())
+              if d.is_dir() and d.name != p["id"] and d.name.startswith(RUN_NAME)
+              and (d / "metrics.csv").exists()]
+    if others:
+        print(f"  {len(others)} other run(s) here: {', '.join(others)}")
     m = milestones(rows)
     print_milestones(m)
     print()
-    # A tagged run writes tagged figures: a 200-step smoke test must not be able
-    # to overwrite the figure the log entry points at.
-    suffix = f"_{args.tag}" if args.tag else ""
-    figure_raw(rows, cfg, suffix)
-    figure_diagram(rows, cfg, m, suffix)
+    # Figures are named for the run, so a 200-step smoke test cannot overwrite
+    # the figure the log entry points at, and a figure on disk always says which
+    # run produced it.
+    figure_raw(rows, cfg, p["id"])
+    figure_diagram(rows, cfg, m, p["id"])
 
 
 # --- list / compare across runs -----------------------------------------------
@@ -521,7 +537,7 @@ def cmd_list(args: argparse.Namespace) -> None:
     if not runs:
         sys.exit(f"no runs in {RUNS.relative_to(ROOT)}/")
 
-    header = (f"{'run':<34} {'opt':<6} {'lr':>7} {'wd':>5} {'L':>2} {'steps':>7} "
+    header = (f"{'run id':<34} {'opt':<6} {'lr':>7} {'wd':>5} {'L':>2} {'steps':>7} "
               f"{'memorised':>10} {'grokked':>9} {'test acc':>9}")
     print(header)
     print("-" * len(header))
@@ -532,7 +548,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(f"{name:<34} {c['optimizer']:<6} {c['lr']:>7g} {c['weight_decay']:>5g} "
               f"{c.get('n_layers', 1):>2} {m['final_step']:>7,} "
               f"{memorised:>10} {grokked:>9} {m['final_test_acc']:>9.4f}")
-    print(f"\n{len(runs)} run(s). Compare them with:")
+    print(f"\n{len(runs)} run(s). Copy a run id from the first column:")
+    print(f"  python scripts/008_grokking.py plot --run {runs[0][0]}")
     print(f"  python scripts/008_grokking.py compare --runs "
           f"{' '.join(n for n, _, _ in runs[:3])}")
 
@@ -599,7 +616,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     tag = argparse.ArgumentParser(add_help=False)
     tag.add_argument("--tag", default=None,
-                     help="suffix for the run directory, to keep runs side by side")
+                     help="name this run yourself instead of deriving the name "
+                          "from what you changed")
 
     t = sub.add_parser(
         "train", parents=[tag], help="run the training (needs torch)",
@@ -654,8 +672,9 @@ def main() -> None:
                          help="overwrite an existing run in that directory")
     t.set_defaults(func=cmd_train)
 
-    p = sub.add_parser("plot", parents=[tag],
-                       help="draw the figures for one run directory")
+    p = sub.add_parser("plot", help="draw the figures for one run")
+    p.add_argument("--run", default=RUN_NAME,
+                   help="run id, as printed by train and by list")
     p.set_defaults(func=cmd_plot)
 
     ls = sub.add_parser("list", help="every run directory, with its settings and result")
